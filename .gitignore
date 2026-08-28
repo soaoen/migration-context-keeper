@@ -7,10 +7,11 @@ dist/
 build/
 *.tsbuildinfo
 
-# Migration context data (user-specific, should NOT be committed)
-.migration-context/
+# 迁移上下文派生物（可从 .migration-context/ 重新生成）
+.migration-context/context-bundle.json
+.migration-context/handoffs/
 
-# Local config (user-specific)
+# 本地配置（每台机器不同，不提交）
 .mckrc.json
 
 # OS

@@ -1,13 +1,18 @@
 # migration-context-keeper
 
-通用迁移上下文管理 Skill —— 解决 **AI 记忆易失、模型切换上下文丢失、长周期迁移失控** 三大痛点。
+通用迁移上下文管理 Skill —— 解决 **AI 记忆易失、模型切换上下文丢失、长周期迁移失控、多机并行撞车** 四大痛点。
 
 ## 功能
 
-- **垂直切片定义**：契约、数据、路由、依赖、验收标准一站式录入
+- **垂直切片定义**：契约、数据、路由、依赖、验收标准、集成检查点一站式录入
 - **架构决策记录**：轻量 ADR，决策-备选-后果可追溯
 - **状态流转**：`defined → implementing → contract-test → shadow → cutover → done`
+- **风险清单**：显式记录迁移中的「不可预知问题」（时序/并发/历史数据/隐式契约/环境）
+- **所有权锁**：`claim/release` 防多机撞车，支持过期检测与强制覆盖
+- **契约验证**：`context check` 检测路由冲突、写表冲突、依赖环、过期认领等
+- **交接包**：`slice handoff` 生成模型/机器间无损交接介质
 - **上下文打包/恢复**：`context dump/load` 实现模型/会话间无损交接
+- **多机协作**：`.migration-context/` 提交进 git 作为唯一事实源
 
 ## 安装
 
@@ -39,16 +44,34 @@ git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skill
 # 3. 记录关键决策
 /mck decision add 001-runtime-choice
 
-# 4. 开发中更新状态
-/mck slice status user-auth implementing
-/mck slice status user-auth contract-test
+# 4. 认领切片（多机并行时防撞车）
+/mck slice claim user-auth
 
-# 5. 模型切换前导出上下文
+# 5. 遇到不可预知问题 → 记录风险
+/mck slice risk add user-auth concurrency "登录与刷新竞态" --mitigate "加锁"
+
+# 6. 模型切换前生成交接包 / 导出上下文
+/mck slice handoff user-auth > auth-handoff.json
 /mck context dump > migration-bundle.json
 
-# 6. 新模型会话恢复
+# 7. 新模型/新机器恢复
 /mck context load migration-bundle.json
 ```
+
+## 多机并行
+
+```bash
+git pull
+/mck context check              # 看冲突/过期认领/未认领切片
+/mck slice claim <name>         # 认领一个切片
+# ... 开发
+/mck slice release <name>       # 完成释放
+git add .migration-context/ && git commit -m "..." && git push
+```
+
+## 契约验证（context check）
+
+检测：路由冲突 / 写表冲突 / 依赖环 / 缺失依赖 / 过期认领 / 无主活跃切片 / 未确认的集成检查点 / 无缓解方案的风险。
 
 ## 依赖
 
@@ -69,16 +92,16 @@ migration-context-keeper/
 
 ## 数据存储
 
-所有数据存储在项目根目录的 `.migration-context/` 下：
+`.migration-context/`（提交进 git，多机共享）：
 
 ```
 .migration-context/
 ├── slices/
-│   └── <slice-name>.json       # 切片定义
+│   └── <slice-name>.json       # 切片定义（含 risks、owner、integrationChecks）
 ├── decisions/
 │   └── <id>-<slug>.md          # 架构决策（Markdown + Frontmatter）
-├── state.json                  # 全局状态
-└── context-bundle.json         # dump 产物
+├── state.json                  # 全局状态 + machines 心跳
+└── context-bundle.json         # dump 产物（派生物，gitignore）
 ```
 
 - 纯文本文件，Git 友好，可 Diff、可 PR Review
