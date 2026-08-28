@@ -1,0 +1,11 @@
+{
+  "name": "migration-context-keeper",
+  "version": "0.1.0",
+  "description": "Migration context keeper CLI for AI-assisted language migration projects",
+  "main": "scripts/mck.ts",
+  "bin": { "mck": "scripts/mck.ts" },
+  "scripts": { "test": "bun scripts/mck.ts --help" },
+  "license": "MIT",
+  "engines": { "bun": ">=1.0" },
+  "keywords": ["migration", "context", "ai", "claude", "skill", "strangler-fig"]
+}
