@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+bun.lockb
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Migration context data (user-specific, should NOT be committed)
+.migration-context/
+
+# Local config (user-specific)
+.mckrc.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

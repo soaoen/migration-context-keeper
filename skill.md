@@ -4,8 +4,22 @@ description: 通用迁移上下文管理 Skill：垂直切片定义、架构决�
 ---
 
 ## 安装
-将此文件放入任意项目的 `.claude/skills/` 目录，或用户级 `~/.claude/skills/` 目录。
-配套脚本 `mck.ts` 需放在同级 `scripts/` 目录（或任意在 PATH 中的位置）。
+
+### Claude Code
+```bash
+# 方式 1：下载脚本到用户级目录
+curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts \
+  -o ~/.claude/scripts/mck.ts
+chmod +x ~/.claude/scripts/mck.ts
+
+# 方式 2：克隆整仓库（便于改源码）
+git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skills/migration-context-keeper
+```
+
+将 `skill.md` 内容放入项目的 `.claude/skills/migration-context-keeper.md`（或用上述 clone 目录）。
+
+### 其他 AI 工具（Cursor / Cline / Windsurf 等）
+将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放在任意可执行路径（或在 PATH 中）。
 
 ## 依赖
 - Bun ≥ 1.0（或 Node ≥ 18 + `--experimental-strip-types`）

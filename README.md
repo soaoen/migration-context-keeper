@@ -11,15 +11,21 @@
 
 ## 安装
 
+### Claude Code
 ```bash
-# 方式 1：直接下载脚本（最简单）
-curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts -o ~/.claude/scripts/mck.ts
+# 方式 1：下载脚本到用户级目录
+curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts \
+  -o ~/.claude/scripts/mck.ts
 chmod +x ~/.claude/scripts/mck.ts
 
 # 方式 2：克隆整仓库（便于改源码）
 git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skills/migration-context-keeper
-ln -s ~/.claude/skills/migration-context-keeper/scripts/mck.ts ~/.claude/scripts/mck.ts
 ```
+
+将 `skill.md` 内容放入项目的 `.claude/skills/migration-context-keeper.md`。
+
+### 其他 AI 工具
+将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放到任意可执行路径。
 
 ## 使用
 
