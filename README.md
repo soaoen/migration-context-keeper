@@ -16,24 +16,28 @@
 - **定时自动提交**：`autocommit` 保证死机后接手零损失
 - **交接包**：`slice handoff` 生成模型/机器间无损交接介质
 - **上下文打包/恢复**：`context dump/load` 实现模型/会话间无损交接
+- **跨工具安装 + agent 自举**：`install-tools` 一条命令装到所有 agent 工具，并注入自然语言引导，让任意工具里的 agent 读引导自行使用
 
 ## 安装
 
-### Claude Code
+### 推荐：一条命令装到所有 agent 工具
 ```bash
-# 方式 1：下载脚本到用户级目录
+git clone https://github.com/soaoen/migration-context-keeper.git /tmp/mck
+cd /tmp/mck
+bun scripts/mck.ts install-tools --yes   # 装 claude/codex/opencode 全局 + 当前项目引导
+export PATH="$HOME/.local/bin:$PATH"     # mck shim 位置
+```
+
+### Claude Code（手动）
+```bash
 curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts \
   -o ~/.claude/scripts/mck.ts
 chmod +x ~/.claude/scripts/mck.ts
-
-# 方式 2：克隆整仓库（便于改源码）
-git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skills/migration-context-keeper
+# 将 skill.md 放入 ~/.claude/skills/migration-context-keeper.md
 ```
 
-将 `skill.md` 内容放入项目的 `.claude/skills/migration-context-keeper.md`。
-
 ### 其他 AI 工具
-将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放到任意可执行路径。
+将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放到任意可执行路径。见下方「跨工具安装」。
 
 ## 使用
 
@@ -83,6 +87,22 @@ git pull                        # 拿到 autocommit 落盘的进度
 
 检测：路由冲突 / 写表冲突 / 依赖环 / 缺失依赖 / 过期认领 / 无主活跃切片 / 未确认的集成检查点 / 无缓解方案的风险。另显示机器活跃、WIP 使用率、波次进度。
 
+## 跨工具安装（agent 自举）
+
+核心（`scripts/mck.ts` + `.migration-context/`）不依赖任何 agent 工具，任何工具都能通过 bash 调用。工具差异只在「skill 放哪」，`mck install-tools` 一次覆盖：
+
+| 工具 | skill 位置 | 引导注入 | 兼容方式 |
+|------|-----------|---------|---------|
+| Claude Code | `~/.claude/skills/` | `CLAUDE.md` | 原生 |
+| opencode | `~/.claude/skills/` | `AGENTS.md` | 官方兼容 Claude skills |
+| Codex CLI | `~/.codex/skills/<name>/SKILL.md` | `AGENTS.md` | 官方格式一致 |
+| Cursor | `.cursor/rules/mck.mdc` | 同左 | 自动生成 |
+| Cline | `.claude/skills/` | 同左 | 兼容目录 |
+
+`install-tools` 向规则文件写入的**自然语言引导段**（marker 块，幂等）告诉任何 agent：迁移任务先查 `mck context check`、开工先 `mck slice claim`、遇问题记 `mck slice risk add`、换机器 `mck context dump` 等。装好后对任意 agent 说「用 mck 管理迁移」即可，agent 自行调用。
+
+> 关键指令：**agent 发现 `mck` 命令不存在时，先跑 `mck install-tools --yes` 安装，而不是放弃使用。**
+
 ## 依赖
 
 - Bun ≥ 1.0（`bun scripts/mck.ts ...`）
@@ -93,12 +113,20 @@ git pull                        # 拿到 autocommit 落盘的进度
 
 ```
 migration-context-keeper/
-├── skill.md                    # Skill 定义文档
+├── skill.md                    # Skill 定义文档（install-tools 的安装源）
 ├── scripts/
-│   └── mck.ts                  # 核心 CLI
+│   └── mck.ts                  # 核心 CLI（跨工具，纯 Bun 无依赖）
 ├── README.md
 ├── LICENSE
 └── package.json
+```
+
+安装后各工具副本：
+```
+~/.claude/skills/migration-context-keeper.md        # Claude Code + opencode
+~/.codex/skills/migration-context-keeper/SKILL.md   # Codex CLI
+~/.claude/scripts/mck.ts                            # 脚本
+~/.local/bin/mck                                    # 可执行 shim（PATH 内）
 ```
 
 ## 数据存储

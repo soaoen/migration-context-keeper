@@ -1,25 +1,41 @@
 ---
 name: migration-context-keeper
-description: 通用迁移上下文管理 Skill：垂直切片定义、架构决策、风险清单、所有权锁、契约验证、交接包、波次管理、WIP 上限、定时自动提交。适用于任何语言/框架迁移项目，支持多机并行与无缝接手。
+description: 通用迁移上下文管理 Skill：垂直切片定义、架构决策、风险清单、所有权锁、契约验证、交接包、波次管理、WIP 上限、定时自动提交、跨工具安装。适用于任何语言/框架迁移项目，支持多机并行与无缝接手。首次使用请运行 install-tools 自动安装到各 agent 工具并注入自然语言引导。
 ---
 
 ## 安装
 
-### Claude Code
+### 推荐：一条命令装到所有 agent 工具（自动 + 幂等）
+
 ```bash
-# 方式 1：下载脚本到用户级目录
+# 1. 克隆仓库（或只下载 scripts/mck.ts 到任意可执行路径）
+git clone https://github.com/soaoen/migration-context-keeper.git /tmp/mck
+cd /tmp/mck
+
+# 2. 自动安装（检测 claude/codex/opencode 全局目录 + 注入当前项目引导）
+bun scripts/mck.ts install-tools --yes
+
+# 3. 把 mck 加入 PATH（shim 已装到 ~/.local/bin）
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+`install-tools` 会：
+- 复制 `skill.md` → Claude Code 全局 `~/.claude/skills/`（opencode 原生兼容此目录）+ Codex `~/.codex/skills/<name>/SKILL.md`
+- 复制 `mck.ts` → `~/.claude/scripts/`、`~/.codex/scripts/`，并在 `~/.local/bin/mck` 装可执行 shim
+- 向项目 `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/mck.mdc` **注入自然语言引导段**（marker 块，幂等：重复运行只更新不追加）
+
+> **agent 自举**：引导段是写给任何 agent 看的自然语言指令。装好后，你对任意工具（Claude Code / opencode / codex / Cursor / Cline…）的 agent 说一句「用 mck 管理迁移」，agent 读到引导就会自己调用 `mck`，无需手工教它命令。
+
+### 手动安装（Claude Code）
+```bash
 curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts \
   -o ~/.claude/scripts/mck.ts
 chmod +x ~/.claude/scripts/mck.ts
-
-# 方式 2：克隆整仓库（便于改源码）
-git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skills/migration-context-keeper
+# 将 skill.md 放入 ~/.claude/skills/migration-context-keeper.md
 ```
 
-将 `skill.md` 内容放入项目的 `.claude/skills/migration-context-keeper.md`。
-
 ### 其他 AI 工具（Cursor / Cline / Windsurf 等）
-将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放在任意可执行路径（或在 PATH 中）。
+将 `skill.md` 放入工具对应的 skills/rules 目录，`scripts/mck.ts` 放在任意可执行路径（或在 PATH 中）。Cursor 可直接复用 `install-tools` 生成的 `.cursor/rules/mck.mdc`。
 
 ## 依赖
 - Bun ≥ 1.0（或 Node ≥ 18 + `--experimental-strip-types`）
@@ -85,6 +101,7 @@ git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skill
 | 命令 | 说明 |
 |------|------|
 | `init` | 初始化 `.migration-context/` 结构 + 机器心跳 |
+| `install-tools [--status] [--project\|--global] [--skill <path>] [--yes]` | 自动安装到各 agent 工具 + 注入自然语言引导（幂等） |
 
 ## 切片状态流转
 ```
@@ -193,6 +210,23 @@ git pull                        # 4. 拿到最新进度（依赖 autocommit 落�
 - `slice define` / `decision add`：采用 **AI 引导式问答**，逐字段确认，生成前预览
 - 所有写入操作均会先显示 diff，确认后再落盘（交互模式下）
 - `context dump/load` 产物可直接喂给新模型会话，实现「无损上下文交接」
+
+## 跨工具安装与 agent 自举
+
+`mck` 的核心（脚本 + `.migration-context/` 数据）**不依赖任何特定 agent 工具**——任何工具都能通过 bash 调用。工具差异只在「skill 放哪」：
+
+| 工具 | skill 位置 | 引导注入位置 | 说明 |
+|------|-----------|-------------|------|
+| Claude Code | `~/.claude/skills/migration-context-keeper.md` | `CLAUDE.md` | 原生支持 |
+| opencode | `~/.claude/skills/`（官方兼容） | `AGENTS.md` | 零适配 |
+| Codex CLI | `~/.codex/skills/<name>/SKILL.md` | `AGENTS.md` | 官方格式一致 |
+| Cursor | `.cursor/rules/mck.mdc` | 同左 | 自动生成 |
+| Cline | `.claude/skills/` | 同左 | 兼容目录 |
+| Windsurf | `.windsurf/rules/` | 同左 | 手动放置 |
+
+一次 `mck install-tools` 覆盖上表所有全局/项目位置，并向规则文件写入**自然语言引导段**——任何 agent 读到后即可自行调用 mck，实现「用户说人话，agent 自举」。
+
+> 对 agent 的关键指令：**`mck` 命令不存在时，先跑 `mck install-tools --yes` 安装，而不是放弃使用。**
 
 ## 典型工作流（单机）
 ```bash

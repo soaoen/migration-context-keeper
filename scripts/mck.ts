@@ -16,7 +16,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hostname } from "node:os";
+import { hostname, homedir } from "node:os";
 import { execSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1024,13 +1024,162 @@ async function cmdContextCheck(config: Config): Promise<void> {
   }
 }
 
+// ===== install-tools（跨工具安装 + 自然语言自举引导） =====
+// 目的：一条命令把 skill 装进所有检测到的 agent 工具，并在项目规则文件里
+// 注入自然语言引导段——任意工具里的 agent 读到引导后就知道怎么用 mck，
+// 实现「用户说人话，agent 自举执行」。
+
+const HOME_DIR = homedir();
+const MCK_SLUG = "migration-context-keeper";
+const BOOTSTRAP_START = "<!-- ===== mck (migration-context-keeper) AUTO-GENERATED START ===== -->";
+const BOOTSTRAP_END = "<!-- ===== mck (migration-context-keeper) AUTO-GENERATED END ===== -->";
+
+function findSkillSource(): string | null {
+  const candidates = [
+    process.env.MCK_SKILL_SOURCE,
+    join(__dirname, "..", "skill.md"),                       // 仓库克隆：scripts/../skill.md
+    join(__dirname, "skill.md"),                             // 同目录
+    join(HOME_DIR, ".claude", "skills", `${MCK_SLUG}.md`),   // 已装副本
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
+}
+
+function findScriptSource(): string {
+  return join(__dirname, "mck.ts");
+}
+
+function bootstrapText(hints: string[]): string {
+  return `${BOOTSTRAP_START}
+
+本项目使用 **mck（migration-context-keeper）** 管理跨语言/跨框架迁移。迁移的全部状态记录在 \`.migration-context/\`（已提交 git）。
+
+当你处理与迁移 / 重构 / 切片 / 架构决策相关的任务时：
+- 先查询上下文再动手，不要凭空假设迁移进度：\`mck context check\`
+- 查看切片：\`mck slice list\`；开工前认领：\`mck slice claim <name>\`
+- 完工释放：\`mck slice release <name>\`；接手掉线/死机机器：\`mck slice takeover <name>\`
+- 遇到不可预知的问题，记录为风险：\`mck slice risk add <name> <类别> <描述> --mitigate "缓解方案"\`
+- 换模型/换机器前导出上下文：\`mck context dump\` 或 \`mck slice handoff <name>\`
+- 长期任务先启动定时自动提交：\`mck autocommit start\`
+- 首次使用先初始化：\`mck init\`
+
+如果 \`mck\` 命令不存在（command not found），先安装它，例如：
+${hints.map(h => `- \`${h}\``).join("\n")}
+装好后重新运行 \`mck init\`。
+
+${BOOTSTRAP_END}`;
+}
+
+// 幂等注入：检测 marker 块，有则整体替换，否则追加
+function injectBlock(path: string, block: string): "install" | "update" {
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
+  const si = existing.indexOf(BOOTSTRAP_START);
+  const ei = existing.indexOf(BOOTSTRAP_END);
+  if (si >= 0 && ei > si) {
+    writeFileSync(path, existing.slice(0, si) + block + existing.slice(ei + BOOTSTRAP_END.length));
+    return "update";
+  }
+  const sep = existing === "" || existing.endsWith("\n") ? "" : "\n";
+  writeFileSync(path, existing + sep + block + "\n");
+  return "install";
+}
+
+function copyFileP(src: string, dest: string): void {
+  const dir = dirname(dest);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(dest, readFileSync(src, "utf-8"));
+}
+
+async function cmdInstallTools(opts: { scope: "all" | "project" | "global"; yes: boolean; status: boolean }): Promise<void> {
+  const isProjectDir = existsSync(join(PROJECT_ROOT, ".git")) || existsSync(join(PROJECT_ROOT, "AGENTS.md")) || existsSync(join(PROJECT_ROOT, "CLAUDE.md")) || existsSync(join(PROJECT_ROOT, ".migration-context"));
+  const skillSrc = findSkillSource();
+  const scriptSrc = findScriptSource();
+  const report: { tool: string; path: string; action: string; ok: boolean }[] = [];
+  const hints: string[] = [];
+
+  // ---- 全局安装 ----
+  if (opts.scope !== "project") {
+    const claudeSkill = join(HOME_DIR, ".claude", "skills", `${MCK_SLUG}.md`);
+    const claudeScript = join(HOME_DIR, ".claude", "scripts", "mck.ts");
+    const codexSkill = join(HOME_DIR, ".codex", "skills", MCK_SLUG, "SKILL.md");
+    const codexScript = join(HOME_DIR, ".codex", "scripts", "mck.ts");
+    const shim = join(HOME_DIR, ".local", "bin", "mck");
+
+    if (skillSrc) {
+      if (!opts.status) {
+        copyFileP(skillSrc, claudeSkill);
+        copyFileP(skillSrc, codexSkill);
+      }
+      report.push({ tool: "Claude Code / opencode", path: claudeSkill, action: opts.status ? "就绪" : "已安装", ok: true });
+      report.push({ tool: "Codex", path: codexSkill, action: opts.status ? "就绪" : "已安装", ok: true });
+    } else {
+      report.push({ tool: "skill 源", path: "未找到 skill.md", action: "用 --skill <path> 指定", ok: false });
+    }
+
+    if (!opts.status) {
+      copyFileP(scriptSrc, claudeScript);
+      copyFileP(scriptSrc, codexScript);
+      const shimBody = `#!/usr/bin/env sh\nexec bun "${claudeScript}" "$@"\n`;
+      if (!existsSync(dirname(shim))) mkdirSync(dirname(shim), { recursive: true });
+      writeFileSync(shim, shimBody);
+      try { execSync(`chmod +x "${shim}"`); } catch {}
+      hints.push(`mck 已装到 ${claudeScript}（shim: ${shim}）`);
+    } else {
+      hints.push(`检测到脚本源 ${scriptSrc}`);
+    }
+    report.push({ tool: "脚本", path: claudeScript, action: opts.status ? "就绪" : "已安装", ok: true });
+  }
+
+  // ---- 项目引导注入（自然语言自举） ----
+  if (opts.scope !== "global") {
+    if (!isProjectDir) {
+      if (opts.scope === "all") {
+        console.log(`  ℹ 当前目录不是项目（无 .git/AGENTS.md/CLAUDE.md/.migration-context），跳过项目引导注入。`);
+        console.log(`    在项目目录内运行本命令以注入引导；或只用 --global。`);
+      }
+    } else {
+      const boot = bootstrapText(hints.length ? hints : ["bun <mck.ts 绝对路径> install-tools --yes"]);
+      const rules: { tool: string; path: string; block: string }[] = [
+        { tool: "AGENTS.md (opencode/codex)", path: join(PROJECT_ROOT, "AGENTS.md"), block: boot },
+        { tool: "CLAUDE.md (claude code)", path: join(PROJECT_ROOT, "CLAUDE.md"), block: boot },
+        { tool: "Cursor rules", path: join(PROJECT_ROOT, ".cursor", "rules", "mck.mdc"), block: `---\ndescription: mck 迁移上下文引导（自动生成，勿删）\nglobs: "**/*"\n---\n${boot}` },
+      ];
+      if (skillSrc) {
+        rules.push({ tool: "项目级 skill", path: join(PROJECT_ROOT, ".claude", "skills", `${MCK_SLUG}.md`), block: readFileSync(skillSrc, "utf-8") });
+      }
+      for (const r of rules) {
+        if (opts.status) {
+          report.push({ tool: r.tool, path: r.path, action: existsSync(r.path) ? "已存在" : "待创建", ok: true });
+          continue;
+        }
+        const res = injectBlock(r.path, r.block);
+        report.push({ tool: r.tool, path: r.path, action: res === "update" ? "已更新" : "已注入", ok: true });
+      }
+    }
+  }
+
+  // ---- 报告 ----
+  console.log(`\n=== mck install-tools ${opts.status ? "检测" : "报告"} ===\n`);
+  for (const r of report) {
+    console.log(`  ${r.ok ? "✓" : "✗"} ${r.tool.padEnd(24)} ${r.path}  [${r.action}]`);
+  }
+  if (hints.length) console.log(`\n  提示: 若 \`mck\` 不在 PATH，把 ${HOME_DIR}/.local/bin 加入 PATH，或直接用 \`bun ${scriptSrc}\`。`);
+  console.log(`\n  完成。现在对任意 agent 说「用 mck 管理迁移」，agent 会读取引导自动使用。`);
+  console.log(`  重新运行本命令可更新引导文本（幂等，不重复追加）。`);
+}
+
 // ===== 主入口 =====
 async function main(): Promise<void> {
   const config = loadConfig();
-  ensureContextDir(config);
 
   const args = process.argv.slice(2);
-  if (args.length === 0) {
+  const installOnly = args[0] === "install-tools";
+  if (!installOnly) ensureContextDir(config);
+  if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
     console.log(`
 用法: mck <subcommand> [args]
 
@@ -1072,6 +1221,8 @@ async function main(): Promise<void> {
 
 其他:
   init                           初始化上下文目录
+  install-tools [--status] [--project|--global] [--skill <path>] [--yes]
+                                 自动安装到各 agent 工具并注入自然语言引导（幂等）
 `);
     process.exit(0);
   }
@@ -1091,6 +1242,11 @@ async function main(): Promise<void> {
       case "init":
         await cmdInit(config);
         break;
+      case "install-tools": {
+        const scope = rest.includes("--project") ? "project" : rest.includes("--global") ? "global" : "all";
+        await cmdInstallTools({ scope, yes: flags.force || rest.includes("--yes"), status: rest.includes("--status") });
+        break;
+      }
       case "slice":
         switch (clean[0]) {
           case "define": await cmdSliceDefine(config, clean[1]); break;
