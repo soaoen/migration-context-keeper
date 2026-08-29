@@ -11,6 +11,9 @@ build/
 .migration-context/context-bundle.json
 .migration-context/handoffs/
 
+# 自动提交状态（每台机器本机状态，不共享）
+.migration-context/auto/
+
 # 本地配置（每台机器不同，不提交）
 .mckrc.json
 

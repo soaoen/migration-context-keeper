@@ -1,6 +1,6 @@
 # migration-context-keeper
 
-通用迁移上下文管理 Skill —— 解决 **AI 记忆易失、模型切换上下文丢失、长周期迁移失控、多机并行撞车** 四大痛点。
+通用迁移上下文管理 Skill —— 解决 **AI 记忆易失、模型切换上下文丢失、长周期迁移失控、多机并行撞车、死机无法接手** 五大痛点。
 
 ## 功能
 
@@ -8,11 +8,14 @@
 - **架构决策记录**：轻量 ADR，决策-备选-后果可追溯
 - **状态流转**：`defined → implementing → contract-test → shadow → cutover → done`
 - **风险清单**：显式记录迁移中的「不可预知问题」（时序/并发/历史数据/隐式契约/环境）
-- **所有权锁**：`claim/release` 防多机撞车，支持过期检测与强制覆盖
+- **所有权锁**：`claim/release` 防多机撞车，`takeover` 无缝接手死机遗留
 - **契约验证**：`context check` 检测路由冲突、写表冲突、依赖环、过期认领等
+- **波次管理**：切片集合分波次推进，机器数量动态适配
+- **WIP 上限**：限制同时在途切片数，防过度并行
+- **机器心跳**：`machines` 查看各机活跃度/认领情况
+- **定时自动提交**：`autocommit` 保证死机后接手零损失
 - **交接包**：`slice handoff` 生成模型/机器间无损交接介质
 - **上下文打包/恢复**：`context dump/load` 实现模型/会话间无损交接
-- **多机协作**：`.migration-context/` 提交进 git 作为唯一事实源
 
 ## 安装
 
@@ -58,25 +61,33 @@ git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skill
 /mck context load migration-bundle.json
 ```
 
-## 多机并行
+## 多机并行 + 无缝接手
 
 ```bash
+# 工作机
 git pull
-/mck context check              # 看冲突/过期认领/未认领切片
-/mck slice claim <name>         # 认领一个切片
+/mck context check              # 看冲突/过期认领/WIP
+/mck slice claim <name>         # 认领（WIP 未满）
+/mck autocommit start           # 启动自动提交，保证接手零损失
 # ... 开发
-/mck slice release <name>       # 完成释放
+/mck slice release <name>
 git add .migration-context/ && git commit -m "..." && git push
+
+# 接手方（原机器死机/掉线后）
+/mck machines                   # 看谁离线、认领了谁
+/mck slice takeover <slice>     # 接手
+git pull                        # 拿到 autocommit 落盘的进度
 ```
 
 ## 契约验证（context check）
 
-检测：路由冲突 / 写表冲突 / 依赖环 / 缺失依赖 / 过期认领 / 无主活跃切片 / 未确认的集成检查点 / 无缓解方案的风险。
+检测：路由冲突 / 写表冲突 / 依赖环 / 缺失依赖 / 过期认领 / 无主活跃切片 / 未确认的集成检查点 / 无缓解方案的风险。另显示机器活跃、WIP 使用率、波次进度。
 
 ## 依赖
 
 - Bun ≥ 1.0（`bun scripts/mck.ts ...`）
 - 无 npm 依赖
+- 多机/自动提交功能需要 git 仓库
 
 ## 目录结构
 
@@ -100,7 +111,8 @@ migration-context-keeper/
 │   └── <slice-name>.json       # 切片定义（含 risks、owner、integrationChecks）
 ├── decisions/
 │   └── <id>-<slug>.md          # 架构决策（Markdown + Frontmatter）
-├── state.json                  # 全局状态 + machines 心跳
+├── state.json                  # 全局状态 + machines 心跳 + wipLimit + wave
+├── auto/autocommit.json        # 自动提交状态（本机，gitignore）
 └── context-bundle.json         # dump 产物（派生物，gitignore）
 ```
 

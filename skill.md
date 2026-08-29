@@ -1,6 +1,6 @@
 ---
 name: migration-context-keeper
-description: 通用迁移上下文管理 Skill：垂直切片定义、架构决策、风险清单、所有权锁、契约验证、交接包、上下文打包/恢复。适用于任何语言/框架迁移项目，支持多机并行协作。
+description: 通用迁移上下文管理 Skill：垂直切片定义、架构决策、风险清单、所有权锁、契约验证、交接包、波次管理、WIP 上限、定时自动提交。适用于任何语言/框架迁移项目，支持多机并行与无缝接手。
 ---
 
 ## 安装
@@ -24,6 +24,7 @@ git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skill
 ## 依赖
 - Bun ≥ 1.0（或 Node ≥ 18 + `--experimental-strip-types`）
 - 无外部 npm 依赖
+- 多机/自动提交功能需要 git 仓库
 
 ## 使用方式
 ```
@@ -36,14 +37,35 @@ git clone https://github.com/soaoen/migration-context-keeper.git ~/.claude/skill
 | 命令 | 说明 |
 |------|------|
 | `slice define <name>` | 交互式定义垂直切片（契约、数据、路由、依赖、验收标准、集成检查点） |
-| `slice list` | 列出所有切片及状态、负责人 |
+| `slice list` | 列出所有切片及状态、负责人、波次归属 |
 | `slice show <name>` | 显示切片完整定义（含风险、owner） |
 | `slice status <name> [new-state]` | 查看/更新切片状态 |
-| `slice claim <name> [--force]` | 认领切片（所有权锁，防多机撞车） |
+| `slice claim <name> [--force]` | 认领切片（受 WIP 上限约束） |
+| `slice takeover <name>` | 接手他人切片（= claim --force 语义化，用于死机/掉线） |
 | `slice release <name> [--force]` | 释放切片 |
 | `slice risk add <name> <类别> <描述> --mitigate "..."` | 记录一条风险（不可预知问题） |
 | `slice risk list <name>` | 列出切片风险 |
 | `slice handoff <name> [output]` | 生成交接包（喂给新模型/新机器） |
+
+### 波次管理
+| 命令 | 说明 |
+|------|------|
+| `wave plan [s1 s2 ...]` | 查看/设置当前波次切片集合 |
+| `wave next` | 推进到下一波次 |
+
+### 并行控制
+| 命令 | 说明 |
+|------|------|
+| `wip show` | 查看 WIP 使用率（活跃切片数/上限） |
+| `wip set <n>` | 设置 WIP 上限 |
+| `machines` | 查看所有机器（心跳/认领） |
+
+### 自动提交（无缝接手关键）
+| 命令 | 说明 |
+|------|------|
+| `autocommit start [分钟]` | 启动定时自动提交（默认 15 分钟） |
+| `autocommit stop` | 停止自动提交 |
+| `autocommit status` | 查看状态 |
 
 ### 决策
 | 命令 | 说明 |
@@ -91,32 +113,67 @@ defined → implementing → contract-test → shadow → cutover → done
 - ℹ **集成检查点**：done 切片还有未确认的集成检查点
 - ℹ **无缓解方案的风险**
 
-## 多机并行协议（5 台机器协作同一项目）
+另显示：机器活跃列表、WIP 使用率、波次进度、切片状态分布。
+
+## 多机并行协议（松耦合：有切片就有活，有机器就能接）
+
 `.migration-context/` **提交进项目 git 仓库**，作为唯一事实源。每台机器 `git pull` 获取最新上下文，改动后 `git push`。
 
+### 基本工作流
 ```bash
-# 每台机器的工作流
 git pull
-/mck context check              # 1. 看冲突/过期认领/未认领切片
-/mck slice claim <name>         # 2. 认领一个切片（防撞车）
+/mck context check              # 1. 看冲突/过期认领/未认领切片/WIP
+/mck slice claim <name>         # 2. 认领一个切片（WIP 未满时）
 # ... 开发，中途 /mck slice status <name> 更新状态
-/mck slice release <name>       # 3. 完成释放
+/mck slice release <name>       # 3. 完成释放，机器自动空闲
 git add .migration-context/ && git commit -m "..." && git push   # 4. 提交共享
 ```
 
-约定：
-- **一次只认领一个切片**，改完 release 再认领下一个
-- 模型/机器切换前：`/mck slice handoff <name>` 产出交接包，喂给下一个 agent
-- 崩溃遗留的过期认领：`/mck context check` 会标出，确认机器已下线后 `claim --force` 覆盖
-- 机器标识用 `os.hostname()`，可用环境变量 `MCK_MACHINE` 覆盖（如 `MCK_MACHINE=machine-3 /mck ...`）
+### 无缝接手（死机/掉线/卡住）
+```bash
+# 接手方：
+/mck machines                   # 1. 看谁离线了、认领了谁
+/mck slice handoff <slice>      # 2. 生成交接包（可选，理解上下文）
+/mck slice takeover <slice>     # 3. 接手（强制覆盖过期认领）
+git pull                        # 4. 拿到最新进度（依赖 autocommit 落盘）
+# 5. 继续开发
+```
+
+### 定时自动提交（保证接手零损失）
+```bash
+/mck autocommit start [分钟]     # 机器开始干活前启动（默认 15 分钟）
+# 每 N 分钟自动 git add/commit/push，进度落盘
+# 即使机器突然死亡，接手方 git pull 即拿到全部半成品
+/mck autocommit status          # 查看
+/mck autocommit stop            # 停止
+```
+- 提交信息带 `[mck] <机器名> autocommit` 前缀，可辨识
+- 半成品提交是设计使然，非错误；这是「无缝接手」的代价
+
+### 波次推进（可选）
+```bash
+/mck wave plan slice-auth slice-channels slice-templates   # 定义本波次切片集合
+# 机器自由认领本波次的切片，跑完 release
+/mck wave next                  # 本波次完成，进入下一波次
+```
+- 波次不绑定具体机器——有多少机器就并行多少，剩余切片留到下一波次
+- 4 切片 3 台 → 3 台各干一个，剩 1 个下波次由任意空闲机器收尾
+
+### WIP 上限（防过度并行）
+```bash
+/mck wip set <n>                # 同时最多 n 个切片在途
+/mck wip show                   # 当前使用率
+```
+- claim 新切片时校验；WIP 满则拒绝
+- WIP 是「并行安全度」的旋钮——切片切得越干净，可安全调得越高
 
 ## 交接包（slice handoff）
 `/mck slice handoff <name>` 生成包含以下内容的 JSON：
 - 切片完整定义（契约、验收标准、集成检查点、风险）
 - 关联的架构决策
 - 依赖切片的状态
-- 全局上下文（当前切片、下一步、风险）
-- **接收者操作清单**（认领 → 实现 → 风险自查 → release）
+- 全局上下文（当前切片、下一步、风险、WIP、波次）
+- **接收者操作清单**（pull → takeover → 实现 → 风险自查 → autocommit → release）
 
 这是「换模型 / 换机器」时的无损交接介质。
 
@@ -127,8 +184,9 @@ git add .migration-context/ && git commit -m "..." && git push   # 4. 提交共�
 │   └── <slice-name>.json    # 切片定义（含 risks、owner、integrationChecks）
 ├── decisions/
 │   └── <id>-<slug>.md       # 架构决策（Markdown + Frontmatter）
-├── state.json               # 全局状态 + machines 心跳
-└── context-bundle.json      # dump 产物（派生物，可 gitignore）
+├── state.json               # 全局状态 + machines 心跳 + wipLimit + wave
+├── auto/autocommit.json     # 自动提交状态（本机，gitignore）
+└── context-bundle.json      # dump 产物（派生物，gitignore）
 ```
 
 ## 交互约定
@@ -153,10 +211,11 @@ git add .migration-context/ && git commit -m "..." && git push   # 4. 提交共�
 # 5. 遇到不可预知问题 → 记录风险
 /mck slice risk add user-auth concurrency "登录与刷新竞态" --mitigate "加锁"
 
-# 6. 模型切换前导出上下文
+# 6. 模型切换前生成交接包 / 导出上下文
+/mck slice handoff user-auth > auth-handoff.json
 /mck context dump > migration-bundle.json
 
-# 7. 新模型会话恢复
+# 7. 新模型/新机器恢复
 /mck context load migration-bundle.json
 ```
 
@@ -166,6 +225,8 @@ git add .migration-context/ && git commit -m "..." && git push   # 4. 提交共�
 {
   "contextDir": ".migration-context",
   "defaultStates": ["defined", "implementing", "contract-test", "shadow", "cutover", "done", "blocked", "abandoned"],
-  "staleClaimHours": 4
+  "staleClaimHours": 4,
+  "defaultWipLimit": 4,
+  "defaultAutoCommitInterval": 15
 }
 ```

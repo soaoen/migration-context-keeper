@@ -3,19 +3,28 @@
  * migration-context-keeper CLI
  * 通用迁移上下文管理工具
  *
- * 能力：切片定义、架构决策、状态追踪、风险清单、所有权锁、契约验证、交接包、上下文打包/恢复
- * 多机协作：.migration-context/ 提交进项目 git 仓库作为唯一事实源，claim/release 防撞车。
+ * 能力：切片定义、架构决策、状态追踪、风险清单、所有权锁、契约验证、交接包、
+ *      波次管理、WIP 上限、机器心跳、定时自动提交（无缝接手）、上下文打包/恢复
+ *
+ * 多机协作模型（松耦合）：
+ *   - 切片集合 + 空闲机器：有切片就有活，有机器就能接
+ *   - claim 受 WIP 上限约束（防过度并行）
+ *   - 死机 → 心跳过期 → 任意机器 takeover
+ *   - 定时自动提交保证接手零损失
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hostname } from "node:os";
+import { execSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = process.cwd();
 const DEFAULT_CONTEXT_DIR = ".migration-context";
 const MACHINE = process.env.MCK_MACHINE || hostname();
+const AUTOSTATE_DIR = join(DEFAULT_CONTEXT_DIR, "auto");
+const AUTOSTATE_FILE = join(AUTOSTATE_DIR, "autocommit.json");
 
 const RISK_CATEGORIES = [
   "timing",            // 时序/组合爆炸
@@ -33,6 +42,8 @@ interface Config {
   contextDir: string;
   defaultStates: string[];
   staleClaimHours: number;
+  defaultWipLimit: number;
+  defaultAutoCommitInterval: number; // 分钟
 }
 
 interface Risk {
@@ -89,7 +100,17 @@ interface GlobalState {
   nextActions: string[];
   risks: string[];
   machines: Record<string, string>; // hostname -> lastActive ISO
+  wipLimit: number;
+  wave: { current: number; plan: string[] };
   updatedAt: string;
+}
+
+interface AutoCommitState {
+  machine: string;
+  pid: number;
+  startedAt: string;
+  intervalMin: number;
+  lastCommitAt: string | null;
 }
 
 // ===== 配置与路径 =====
@@ -99,6 +120,8 @@ function loadConfig(): Config {
     contextDir: DEFAULT_CONTEXT_DIR,
     defaultStates: ["defined", "implementing", "contract-test", "shadow", "cutover", "done", "blocked", "abandoned"],
     staleClaimHours: 4,
+    defaultWipLimit: 4,
+    defaultAutoCommitInterval: 15,
   };
   if (existsSync(configPath)) {
     return { ...defaults, ...JSON.parse(readFileSync(configPath, "utf-8")) };
@@ -123,6 +146,8 @@ function ensureContextDir(config: Config): void {
       nextActions: [],
       risks: [],
       machines: {},
+      wipLimit: config.defaultWipLimit,
+      wave: { current: 1, plan: [] },
       updatedAt: new Date().toISOString(),
     });
   }
@@ -177,10 +202,7 @@ function listDecisions(config: Config): Decision[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter(f => f.endsWith(".md"))
-    .map(f => {
-      const content = readFileSync(join(dir, f), "utf-8");
-      return parseDecisionMD(content);
-    });
+    .map(f => parseDecisionMD(readFileSync(join(dir, f), "utf-8")));
 }
 
 function parseDecisionMD(content: string): Decision {
@@ -229,10 +251,17 @@ function statePath(config: Config): string {
 function loadState(config: Config): GlobalState {
   const p = statePath(config);
   if (!existsSync(p)) {
-    return { currentSlice: null, nextActions: [], risks: [], machines: {}, updatedAt: nowISO() };
+    return {
+      currentSlice: null, nextActions: [], risks: [], machines: {},
+      wipLimit: config.defaultWipLimit,
+      wave: { current: 1, plan: [] },
+      updatedAt: nowISO(),
+    };
   }
   const s = JSON.parse(readFileSync(p, "utf-8"));
   s.machines = s.machines || {};
+  if (typeof s.wipLimit !== "number") s.wipLimit = config.defaultWipLimit;
+  if (!s.wave) s.wave = { current: 1, plan: [] };
   return s;
 }
 
@@ -240,10 +269,15 @@ function saveState(config: Config, state: GlobalState): void {
   writeFileSync(statePath(config), JSON.stringify({ ...state, updatedAt: nowISO() }, null, 2));
 }
 
+// ===== WIP =====
+function countActiveSlices(slices: Slice[]): number {
+  return slices.filter(s => ACTIVE_STATES.includes(s.state)).length;
+}
+
 // ===== Context Bundle =====
 function dumpContext(config: Config): object {
   return {
-    version: 2,
+    version: 3,
     exportedAt: nowISO(),
     slices: listSlices(config),
     decisions: listDecisions(config),
@@ -278,12 +312,77 @@ async function askMulti(question: string): Promise<string[]> {
   return items;
 }
 
+// ===== git 辅助 =====
+function isGitRepo(): boolean {
+  try {
+    execSync("git rev-parse --is-inside-work-tree", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function gitAutoCommit(machine: string): string {
+  const ts = nowISO().replace(/[:.]/g, "-");
+  const msg = `[mck] ${machine} autocommit ${ts}`;
+  try {
+    execSync("git add -A", { stdio: "pipe" });
+    execSync(`git commit -m "${msg}" --allow-empty`, { stdio: "pipe" });
+    execSync("git push --porcelain", { stdio: "pipe", timeout: 60000 });
+    return `committed+${msg}`;
+  } catch (e) {
+    const err = e as any;
+    const out = String(err?.stdout || "") + String(err?.stderr || "");
+    if (out.includes("nothing to commit")) return "nothing to commit";
+    // commit 可能已成功但 push 失败
+    return `commit ok, push failed: ${out.slice(0, 200)}`;
+  }
+}
+
 // ===== 命令：init =====
 async function cmdInit(config: Config): Promise<void> {
   ensureContextDir(config);
   touch(config);
   console.log(`✓ 初始化完成: ${getContextDir(config)}`);
   console.log(`  机器标识: ${MACHINE}`);
+  console.log(`  WIP 上限: ${loadState(config).wipLimit}`);
+  if (!isGitRepo()) {
+    console.log(`  ⚠ 当前目录不是 git 仓库。多机协作需要 git；纯本地使用可忽略。`);
+  }
+}
+
+// ===== 命令：wave =====
+async function cmdWavePlan(config: Config, plan?: string[]): Promise<void> {
+  const state = loadState(config);
+  if (!plan || plan.length === 0) {
+    console.log(`\n当前波次: ${state.wave.current}`);
+    console.log(`计划切片: ${state.wave.plan.length ? state.wave.plan.join(", ") : "（空）"}`);
+    const slices = listSlices(config);
+    if (slices.length) {
+      const inWave = slices.filter(s => state.wave.plan.includes(s.name));
+      const notInWave = slices.filter(s => !state.wave.plan.includes(s.name));
+      console.log(`\n本波次切片:`);
+      for (const s of inWave) console.log(`  ✓ ${s.name} [${s.state}]`);
+      if (notInWave.length) {
+        console.log(`\n未入波次切片（可作为后续波次）:`);
+        for (const s of notInWave) console.log(`  · ${s.name} [${s.state}]`);
+      }
+    }
+    return;
+  }
+  state.wave.plan = plan;
+  saveState(config, state);
+  touch(config);
+  console.log(`✓ 波次 ${state.wave.current} 计划: ${plan.join(", ")}`);
+}
+
+async function cmdWaveNext(config: Config): Promise<void> {
+  const state = loadState(config);
+  state.wave.current += 1;
+  state.wave.plan = [];
+  saveState(config, state);
+  touch(config);
+  console.log(`✓ 已进入波次 ${state.wave.current}（计划清空，用 wave plan 定义新波次）`);
 }
 
 // ===== 命令：slice define =====
@@ -350,14 +449,16 @@ async function cmdSliceDefine(config: Config, name: string): Promise<void> {
 // ===== 命令：slice list =====
 async function cmdSliceList(config: Config): Promise<void> {
   const slices = listSlices(config);
+  const state = loadState(config);
   if (slices.length === 0) {
     console.log("暂无切片");
     return;
   }
-  console.log("\n切片列表:");
+  console.log(`\n切片列表 (波次 ${state.wave.current}):`);
   for (const s of slices) {
     const owner = s.owner ? `[@${s.owner.machine}]` : "";
-    console.log(`  ${s.name.padEnd(24)} ${s.state.padEnd(16)} ${owner.padEnd(16)} ${s.description}`);
+    const inWave = state.wave.plan.includes(s.name) ? "" : " (未入波次)";
+    console.log(`  ${s.name.padEnd(24)} ${s.state.padEnd(16)} ${owner.padEnd(20)} ${s.description}${inWave}`);
   }
 }
 
@@ -395,7 +496,7 @@ async function cmdSliceShow(config: Config, name: string): Promise<void> {
   console.log(JSON.stringify(slice, null, 2));
 }
 
-// ===== 命令：slice claim / release（所有权锁）=====
+// ===== 命令：slice claim / release / takeover =====
 async function cmdSliceClaim(config: Config, name: string, force: boolean, machine?: string): Promise<void> {
   const slice = loadSlice(config, name);
   if (!slice) {
@@ -403,18 +504,34 @@ async function cmdSliceClaim(config: Config, name: string, force: boolean, machi
     process.exit(1);
   }
   const m = machine || MACHINE;
+
+  // 已被自己认领
+  if (slice.owner && slice.owner.machine === m) {
+    console.log(`✓ ${name} 已由 ${m} 认领（无需重复）`);
+    return;
+  }
+
+  // 被他人认领 → 需 force 且机器应已过期
   if (slice.owner) {
-    if (slice.owner.machine === m) {
-      console.log(`✓ ${name} 已由 ${m} 认领（无需重复）`);
-      return;
-    }
     if (!force) {
       console.error(`✗ 切片 "${name}" 已被 ${slice.owner.machine} 认领 (${slice.owner.claimedAt})。`);
-      console.error(`  若该机器已下线，用 --force 强制覆盖。`);
+      console.error(`  若该机器已掉线/过期，用 takeover 或 claim --force 接手。`);
       process.exit(1);
     }
-    console.log(`⚠ 强制覆盖 ${slice.owner.machine} 的认领`);
+    console.log(`⚠ 强制接手 ${slice.owner.machine} 的认领`);
   }
+
+  // WIP 上限校验（接管不算新占）
+  if (!slice.owner) {
+    const active = countActiveSlices(listSlices(config));
+    const wipLimit = loadState(config).wipLimit;
+    if (active >= wipLimit && !ACTIVE_STATES.includes(slice.state)) {
+      console.error(`✗ 已达 WIP 上限 (${active}/${wipLimit})。释放一个活跃切片或提高 wipLimit 后再 claim。`);
+      console.error(`  设置: /mck wip set <n>`);
+      process.exit(1);
+    }
+  }
+
   slice.owner = { machine: m, claimedAt: nowISO() };
   slice.updatedAt = nowISO();
   saveSlice(config, slice);
@@ -486,7 +603,7 @@ async function cmdSliceRiskList(config: Config, name: string): Promise<void> {
   }
 }
 
-// ===== 命令：slice handoff（交接包）=====
+// ===== 命令：slice handoff =====
 async function cmdSliceHandoff(config: Config, name: string, output?: string): Promise<void> {
   const slice = loadSlice(config, name);
   if (!slice) {
@@ -502,7 +619,7 @@ async function cmdSliceHandoff(config: Config, name: string, output?: string): P
 
   const bundle = {
     type: "slice-handoff",
-    version: 1,
+    version: 2,
     exportedAt: nowISO(),
     fromMachine: MACHINE,
     slice,
@@ -512,14 +629,17 @@ async function cmdSliceHandoff(config: Config, name: string, output?: string): P
       currentSlice: state.currentSlice,
       nextActions: state.nextActions,
       risks: state.risks,
+      wipLimit: state.wipLimit,
+      wave: state.wave,
     },
-    checklist: [
+    handoffChecklist: [
       `1. 读取本包 → 理解切片契约/验收标准/集成检查点`,
       `2. 检查依赖状态 (depStates)，未就绪的切片先对齐`,
-      `3. 认领: /mck slice claim ${name}`,
-      `4. 逐条完成 acceptance 中的验收标准`,
-      `5. 风险自查: 对照 risks 列表逐条确认，新发现的问题用 "/mck slice risk add ${name} <类别> <描述> <缓解>" 记录`,
-      `6. 完成 contract-test → shadow → cutover 后 release`,
+      `3. 确认 git 最新: git pull`,
+      `4. 接手: /mck takeover ${name}`,
+      `5. 逐条完成 acceptance 中的验收标准`,
+      `6. 风险自查: 对照 risks 逐条确认，新问题用 "/mck slice risk add ${name} <类别> <描述> --mitigate ..." 记录`,
+      `7. 完成后 release，未完成也定期 autocommit 保证进度落盘`,
     ],
   };
 
@@ -533,7 +653,7 @@ async function cmdSliceHandoff(config: Config, name: string, output?: string): P
   }
 }
 
-// ===== 命令：decision add =====
+// ===== 命令：decision =====
 async function cmdDecisionAdd(config: Config, id: string): Promise<void> {
   console.log(`\n=== 记录决策: ${id} ===\n`);
   const slug = await ask("Slug（用于文件名，如 runtime-choice）", slugify(id));
@@ -595,7 +715,155 @@ async function cmdDecisionShow(config: Config, id: string): Promise<void> {
   console.log(readFileSync(decisionPath(config, dec.id, dec.slug), "utf-8"));
 }
 
-// ===== 命令：context dump / load =====
+// ===== 命令：wip =====
+async function cmdWipShow(config: Config): Promise<void> {
+  const state = loadState(config);
+  const slices = listSlices(config);
+  const active = countActiveSlices(slices);
+  console.log(`\nWIP: ${active}/${state.wipLimit}`);
+  console.log(`活跃切片:`);
+  for (const s of slices) {
+    if (ACTIVE_STATES.includes(s.state)) {
+      console.log(`  ${s.name.padEnd(24)} ${s.state.padEnd(16)} ${s.owner ? "@" + s.owner.machine : "(无主)"}`);
+    }
+  }
+}
+
+async function cmdWipSet(config: Config, n: number): Promise<void> {
+  if (!Number.isInteger(n) || n < 1) {
+    console.error(`无效 WIP 上限: ${n}。需为正整数。`);
+    process.exit(1);
+  }
+  const state = loadState(config);
+  state.wipLimit = n;
+  saveState(config, state);
+  touch(config);
+  console.log(`✓ WIP 上限设为: ${n}`);
+}
+
+// ===== 命令：machines =====
+async function cmdMachines(config: Config): Promise<void> {
+  const state = loadState(config);
+  const slices = listSlices(config);
+  const now = Date.now();
+  console.log(`\n机器列表:`);
+  const entries = Object.entries(state.machines);
+  if (entries.length === 0) {
+    console.log("  暂无机器心跳记录");
+    return;
+  }
+  for (const [m, t] of entries) {
+    const ageMin = (now - new Date(t).getTime()) / 60000;
+    const status = ageMin < 60 ? "活跃" : `离线 (${(ageMin / 60).toFixed(1)}h前)`;
+    const claimed = slices.filter(s => s.owner?.machine === m).map(s => s.name).join(", ");
+    const isSelf = m === MACHINE ? " ←本机" : "";
+    console.log(`  ${m.padEnd(28)} ${status.padEnd(20)} 认领: ${claimed || "-"}${isSelf}`);
+  }
+}
+
+// ===== 命令：autocommit =====
+function autocommitStatePath(): string {
+  return resolve(PROJECT_ROOT, AUTOSTATE_FILE);
+}
+
+function loadAutoState(): AutoCommitState | null {
+  try {
+    const p = autocommitStatePath();
+    if (!existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveAutoState(s: AutoCommitState): void {
+  const p = autocommitStatePath();
+  if (!existsSync(AUTOSTATE_DIR)) mkdirSync(AUTOSTATE_DIR, { recursive: true });
+  writeFileSync(p, JSON.stringify(s, null, 2));
+}
+
+// 自动提交循环（后台间隔运行）
+function startAutoCommitLoop(config: Config, intervalMin: number): void {
+  if (!isGitRepo()) {
+    console.error("✗ 当前目录不是 git 仓库，无法 autocommit。");
+    process.exit(1);
+  }
+  const existing = loadAutoState();
+  if (existing && existing.machine === MACHINE) {
+    try {
+      process.kill(existing.pid, 0);
+      console.log(`✓ autocommit 已在运行 (pid ${existing.pid}, 每 ${existing.intervalMin} 分钟)`);
+      return;
+    } catch {
+      // pid 不存在，残留状态，覆盖
+    }
+  }
+
+  const state: AutoCommitState = {
+    machine: MACHINE,
+    pid: process.pid,
+    startedAt: nowISO(),
+    intervalMin,
+    lastCommitAt: null,
+  };
+  saveAutoState(state);
+
+  console.log(`✓ autocommit 已启动 (pid ${process.pid}, 每 ${intervalMin} 分钟)`);
+  console.log(`  会在每次 git 有改动时自动 add/commit/push，保证接手零损失`);
+  console.log(`  本进程需保持运行；停止用: /mck autocommit stop`);
+
+  const loop = async () => {
+    const s = loadAutoState();
+    if (!s || s.machine !== MACHINE || s.pid !== process.pid) return;
+    const msg = gitAutoCommit(MACHINE);
+    const updated = loadAutoState();
+    if (updated) {
+      updated.lastCommitAt = nowISO();
+      saveAutoState(updated);
+    }
+    if (msg !== "nothing to commit") {
+      console.log(`  [${new Date().toLocaleTimeString()}] ${msg}`);
+    }
+  };
+  setInterval(loop, intervalMin * 60 * 1000);
+  // 启动时立即跑一次
+  setTimeout(loop, 3000);
+}
+
+async function cmdAutoCommitStop(): Promise<void> {
+  const existing = loadAutoState();
+  if (!existing) {
+    console.log("autocommit 未在运行");
+    return;
+  }
+  try {
+    unlinkSync(autocommitStatePath());
+  } catch {}
+  console.log(`✓ autocommit 已停止 (${existing.machine})`);
+  console.log(`  注意: 若该进程仍在运行，需手动结束 (kill ${existing.pid})`);
+}
+
+async function cmdAutoCommitStatus(): Promise<void> {
+  const existing = loadAutoState();
+  if (!existing) {
+    console.log("autocommit 未在运行");
+    return;
+  }
+  let alive = true;
+  try {
+    process.kill(existing.pid, 0);
+  } catch {
+    alive = false;
+  }
+  console.log(`\nautocommit 状态:`);
+  console.log(`  机器: ${existing.machine}`);
+  console.log(`  PID: ${existing.pid} (${alive ? "存活" : "已死，状态残留"})`);
+  console.log(`  间隔: 每 ${existing.intervalMin} 分钟`);
+  console.log(`  启动: ${existing.startedAt}`);
+  console.log(`  上次提交: ${existing.lastCommitAt || "尚未"}`);
+}
+
+// ===== 命令：context dump / load / check =====
 async function cmdContextDump(config: Config, output?: string): Promise<void> {
   const json = JSON.stringify(dumpContext(config), null, 2);
   if (output) {
@@ -618,10 +886,9 @@ async function cmdContextLoad(config: Config, file: string): Promise<void> {
   console.log(`✓ 上下文已从 ${file} 恢复`);
 }
 
-// ===== 命令：context check（契约验证 + 健康检查）=====
 function findCycle(slices: Slice[]): string[] | null {
   const idx = new Map(slices.map((s, i) => [s.name, i]));
-  const visited = new Array(slices.length).fill(0); // 0=未访问 1=在栈 2=完成
+  const visited = new Array(slices.length).fill(0);
   const stack: string[] = [];
   const dfs = (i: number): string[] | null => {
     if (visited[i] === 1) {
@@ -660,6 +927,9 @@ async function cmdContextCheck(config: Config): Promise<void> {
     .map(([m, t]) => `${m}(${(now - new Date(t).getTime()) / 3600000 < 1 ? "活跃" : "离线"})`)
     .join(", ");
   console.log(`\n机器: ${activeMachines || "暂无"}`);
+
+  const active = countActiveSlices(slices);
+  console.log(`WIP: ${active}/${state.wipLimit}  波次 ${state.wave.current}`);
 
   // 1. 路由冲突
   const routeMap = new Map<string, string[]>();
@@ -715,7 +985,7 @@ async function cmdContextCheck(config: Config): Promise<void> {
   // 6. 活跃但无主
   for (const s of slices) {
     if (ACTIVE_STATES.includes(s.state) && !s.owner) {
-      issues.push({ severity: "warn", msg: `切片 "${s.name}" 处于 ${s.state} 但无负责人（建议 claim）` });
+      issues.push({ severity: "warn", msg: `切片 "${s.name}" 处于 ${s.state} 但无负责人（建议 claim 或 takeover）` });
     }
   }
 
@@ -769,11 +1039,26 @@ async function main(): Promise<void> {
   slice list                     列出所有切片
   slice show <name>              显示切片详情
   slice status <name> [state]    查看/更新切片状态
-  slice claim <name> [--force]   认领切片（所有权锁，防多机撞车）
+  slice claim <name> [--force]   认领切片（受 WIP 上限约束）
+  slice takeover <name>          接手他人切片（= claim --force 语义化）
   slice release <name> [--force] 释放切片
   slice risk add <name> <类别> <描述> --mitigate "..."   记录风险
   slice risk list <name>         列出风险
   slice handoff <name> [out]     生成交接包（喂给新模型/新机器）
+
+波次:
+  wave plan [s1 s2 ...]          查看/设置当前波次切片集合
+  wave next                      推进到下一波次
+
+并行控制:
+  wip show                       查看 WIP 使用率
+  wip set <n>                    设置 WIP 上限
+  machines                       查看所有机器（心跳/认领）
+
+自动提交（无缝接手）:
+  autocommit start [分钟]        启动定时自动提交（默认 15 分钟）
+  autocommit stop                停止自动提交
+  autocommit status              查看状态
 
 决策:
   decision add <id>              记录架构决策
@@ -781,7 +1066,7 @@ async function main(): Promise<void> {
   decision show <id>             显示决策详情
 
 上下文:
-  context check                  契约验证 + 健康检查（路由/写表/依赖环/认领）
+  context check                  契约验证 + 健康检查
   context dump [out]             导出上下文包
   context load <file>            从包恢复上下文
 
@@ -813,6 +1098,7 @@ async function main(): Promise<void> {
           case "show": await cmdSliceShow(config, clean[1]); break;
           case "status": await cmdSliceStatus(config, clean[1], clean[2]); break;
           case "claim": await cmdSliceClaim(config, clean[1], flags.force, clean[2]); break;
+          case "takeover": await cmdSliceClaim(config, clean[1], true, clean[2]); break;
           case "release": await cmdSliceRelease(config, clean[1], flags.force); break;
           case "risk":
             switch (clean[1]) {
@@ -823,6 +1109,31 @@ async function main(): Promise<void> {
             break;
           case "handoff": await cmdSliceHandoff(config, clean[1], clean[2]); break;
           default: console.error(`未知 slice 子命令: ${clean[0]}`); process.exit(1);
+        }
+        break;
+      case "wave":
+        switch (clean[0]) {
+          case "plan": await cmdWavePlan(config, clean.slice(1)); break;
+          case "next": await cmdWaveNext(config); break;
+          default: console.error(`未知 wave 子命令: ${clean[0]}`); process.exit(1);
+        }
+        break;
+      case "wip":
+        switch (clean[0]) {
+          case "show": await cmdWipShow(config); break;
+          case "set": await cmdWipSet(config, parseInt(clean[1], 10)); break;
+          default: console.error(`未知 wip 子命令: ${clean[0]}`); process.exit(1);
+        }
+        break;
+      case "machines":
+        await cmdMachines(config);
+        break;
+      case "autocommit":
+        switch (clean[0]) {
+          case "start": startAutoCommitLoop(config, parseInt(clean[1], 10) || config.defaultAutoCommitInterval); break;
+          case "stop": await cmdAutoCommitStop(); break;
+          case "status": await cmdAutoCommitStatus(); break;
+          default: console.error(`未知 autocommit 子命令: ${clean[0]}`); process.exit(1);
         }
         break;
       case "decision":
