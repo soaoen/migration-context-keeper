@@ -5,26 +5,25 @@ description: 通用迁移上下文管理 Skill：垂直切片定义、架构决�
 
 ## 安装
 
-### 推荐：一条命令装到所有 agent 工具（自动 + 幂等）
-
+### 一条命令（推荐，约 10 秒）
 ```bash
-# 1. 克隆仓库（或只下载 scripts/mck.ts 到任意可执行路径）
-git clone https://github.com/soaoen/migration-context-keeper.git /tmp/mck
-cd /tmp/mck
-
-# 2. 自动安装（检测 claude/codex/opencode 全局目录 + 注入当前项目引导）
-bun scripts/mck.ts install-tools --yes
-
-# 3. 把 mck 加入 PATH（shim 已装到 ~/.local/bin）
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/install.sh | bash
 ```
 
-`install-tools` 会：
-- 复制 `skill.md` → Claude Code 全局 `~/.claude/skills/`（opencode 原生兼容此目录）+ Codex `~/.codex/skills/<name>/SKILL.md`
-- 复制 `mck.ts` → `~/.claude/scripts/`、`~/.codex/scripts/`，并在 `~/.local/bin/mck` 装可执行 shim
-- 向项目 `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/mck.mdc` **注入自然语言引导段**（marker 块，幂等：重复运行只更新不追加）
+自动完成：
+- 克隆仓库到 `~/.claude/skills/migration-context-keeper/`（技能目录）
+- 安装 CLI 到 `~/.claude/scripts/mck.ts` + PATH shim `~/.local/bin/mck`
+- 注入自然语言引导段到 `~/.claude/CLAUDE.md`（幂等，marker 块，重复安装只更新）
+- 自动检测系统代理（http_proxy/https_proxy 或 127.0.0.1:7897/7890），无需手动配代理
 
-> **agent 自举**：引导段是写给任何 agent 看的自然语言指令。装好后，你对任意工具（Claude Code / opencode / codex / Cursor / Cline…）的 agent 说一句「用 mck 管理迁移」，agent 读到引导就会自己调用 `mck`，无需手工教它命令。
+> **agent 自举**：装好后，你对任意 agent（Claude Code / opencode / codex / Cursor / Cline…）说一句「用 mck 管理迁移」，agent 读到 CLAUDE.md 引导就会自己调用 `mck`；若 `mck` 命令不存在，agent 会自行用上面的 curl 命令安装。
+
+### 其他 AI 工具（codex / opencode / cursor 等）
+```bash
+mck install-tools --yes
+# 或：bun ~/.claude/scripts/mck.ts install-tools --yes
+```
+检测所有已安装的 agent 工具，复制 skill 到各自 skills 目录，并注入自然语言引导到 `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/`。
 
 ### 手动安装（Claude Code）
 ```bash
@@ -33,9 +32,6 @@ curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/mai
 chmod +x ~/.claude/scripts/mck.ts
 # 将 skill.md 放入 ~/.claude/skills/migration-context-keeper.md
 ```
-
-### 其他 AI 工具（Cursor / Cline / Windsurf 等）
-将 `skill.md` 放入工具对应的 skills/rules 目录，`scripts/mck.ts` 放在任意可执行路径（或在 PATH 中）。Cursor 可直接复用 `install-tools` 生成的 `.cursor/rules/mck.mdc`。
 
 ## 依赖
 - Bun ≥ 1.0（或 Node ≥ 18 + `--experimental-strip-types`）

@@ -20,24 +20,28 @@
 
 ## 安装
 
-### 推荐：一条命令装到所有 agent 工具
+### 一条命令（推荐）
 ```bash
-git clone https://github.com/soaoen/migration-context-keeper.git /tmp/mck
-cd /tmp/mck
-bun scripts/mck.ts install-tools --yes   # 装 claude/codex/opencode 全局 + 当前项目引导
-export PATH="$HOME/.local/bin:$PATH"     # mck shim 位置
+curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/install.sh | bash
 ```
 
-### Claude Code（手动）
-```bash
-curl -fsSL https://raw.githubusercontent.com/soaoen/migration-context-keeper/main/scripts/mck.ts \
-  -o ~/.claude/scripts/mck.ts
-chmod +x ~/.claude/scripts/mck.ts
-# 将 skill.md 放入 ~/.claude/skills/migration-context-keeper.md
-```
+自动完成：
+- 克隆仓库到 `~/.claude/skills/migration-context-keeper/`（技能目录）
+- 安装 CLI 到 `~/.claude/scripts/mck.ts` + PATH shim `~/.local/bin/mck`
+- 注入自然语言引导段到 `~/.claude/CLAUDE.md`（幂等，marker 块，重复安装只更新）
+- 自动检测系统代理（http_proxy/https_proxy 或 127.0.0.1:7897/7890 等），无需手动配代理
 
-### 其他 AI 工具
-将 `skill.md` 放入工具对应的 skills 目录，`scripts/mck.ts` 放到任意可执行路径。见下方「跨工具安装」。
+更新：重跑上面命令即可（git pull + 重新注入）。
+
+> 装好后对任意 agent 说「用 mck 管理迁移」，agent 读到 CLAUDE.md 引导自动使用 mck；若 `mck` 命令不存在，agent 会自行用上面的 curl 命令安装。
+
+### 其他 AI 工具（codex / opencode / cursor 等）
+仓库自带 `install-tools` 子命令，一条命令装到所有工具：
+```bash
+mck install-tools --yes
+# 或：bun ~/.claude/scripts/mck.ts install-tools --yes
+```
+检测所有已安装的 agent 工具，复制 skill 到各自 skills 目录，并注入自然语言引导到 `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/`。
 
 ## 使用
 
@@ -114,6 +118,7 @@ git pull                        # 拿到 autocommit 落盘的进度
 ```
 migration-context-keeper/
 ├── skill.md                    # Skill 定义文档（install-tools 的安装源）
+├── install.sh                  # 一键安装脚本（curl 管道执行）
 ├── scripts/
 │   └── mck.ts                  # 核心 CLI（跨工具，纯 Bun 无依赖）
 ├── README.md
