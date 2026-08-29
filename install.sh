@@ -20,15 +20,26 @@ SCRIPTS_DIR="$HOME/.claude/scripts"
 SHIM_DIR="$HOME/.local/bin"
 MCK_SCRIPT="$SCRIPTS_DIR/mck.ts"
 
+say() { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m⚠\033[0m %s\n' "$*"; }
+die() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+BOOTSTRAP_START="<!-- ===== mck (migration-context-keeper) AUTO-GENERATED START ===== -->"
+BOOTSTRAP_END="<!-- ===== mck (migration-context-keeper) AUTO-GENERATED END ===== -->"
+
 # 代理：优先环境变量（http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY），
 # 其次常见本地代理端口（7890 Clash/7897 等），避免裸连 github 超时。
+# 用 curl 带 2s 超时探测端口，避免 nc -z 无响应卡住（nc 在无连接时可能长等）。
 detect_proxy() {
   [ -n "${https_proxy:-}" ] && { echo "$https_proxy"; return; }
   [ -n "${HTTPS_PROXY:-}" ] && { echo "$HTTPS_PROXY"; return; }
   [ -n "${http_proxy:-}" ] && { echo "$http_proxy"; return; }
   [ -n "${HTTP_PROXY:-}" ] && { echo "$HTTP_PROXY"; return; }
   for p in 7897 7890 1087 10809; do
-    if nc -z 127.0.0.1 "$p" >/dev/null 2>&1; then echo "http://127.0.0.1:$p"; return; fi
+    if curl -s --connect-timeout 2 -x "http://127.0.0.1:$p" https://api.github.com/rate_limit -o /dev/null 2>/dev/null; then
+      echo "http://127.0.0.1:$p"
+      return
+    fi
   done
   echo ""
 }
@@ -38,13 +49,6 @@ if [ -n "$PROXY" ]; then
   GIT_PROXY_ARGS="-c http.proxy=$PROXY -c https.proxy=$PROXY"
   say "检测到代理 $PROXY"
 fi
-
-BOOTSTRAP_START="<!-- ===== mck (migration-context-keeper) AUTO-GENERATED START ===== -->"
-BOOTSTRAP_END="<!-- ===== mck (migration-context-keeper) AUTO-GENERATED END ===== -->"
-
-say() { printf '\033[32m✓\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m⚠\033[0m %s\n' "$*"; }
-die() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- 前置检查 ---
 command -v git >/dev/null 2>&1 || die "需要 git 但未安装"
